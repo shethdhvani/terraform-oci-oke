@@ -59,14 +59,35 @@ variable "cni_type" {
 
 variable "enable_ipv6" {
   default     = false
-  description = "Whether to create a dual-stack (IPv4/IPv6) cluster."
+  description = "Deprecated compatibility alias for enable_dual_stack_defaults."
+  type        = bool
+}
+
+variable "enable_dual_stack_defaults" {
+  default     = false
+  description = "Whether to apply default settings for a dual-stack (IPv4/IPv6) cluster and network."
   type        = bool
 }
 
 variable "oke_ip_families" {
   default     = []
   type        = list(string)
-  description = "Override the ip_families attribute for the OKE cluster. Supported values: ['IPv4'] or ['IPV4', 'IPv6']"
+  description = "Override the ip_families attribute for the OKE cluster. Supported values: ['IPv4'] or ['IPv4', 'IPv6'] or ['IPv6']"
+
+  validation {
+    condition = length(var.oke_ip_families) == 0 || (
+      length(var.oke_ip_families) <= 2 &&
+      alltrue([
+        for family in var.oke_ip_families : contains(["IPv4", "IPv6"], family)
+      ])
+    )
+    error_message = "Accepted values are 'IPv4', 'IPv6', or a combination of both. Example: ['IPv4'] or ['IPv4', 'IPv6'] or ['IPv6']."
+  }
+
+  validation {
+    condition     = length(var.oke_ip_families) == length(distinct(var.oke_ip_families))
+    error_message = "Duplicate values are not allowed in oke_ip_families."
+  }
 }
 
 variable "pods_cidr" {

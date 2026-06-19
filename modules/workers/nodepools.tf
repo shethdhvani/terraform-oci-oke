@@ -14,6 +14,8 @@ resource "oci_containerengine_node_pool" "tfscaled_workers" {
   node_shape         = each.value.shape
   ssh_public_key     = var.ssh_public_key
 
+  network_launch_type = each.value.network_launch_type
+
   node_config_details {
     size                                = each.value.size
     is_pv_encryption_in_transit_enabled = each.value.pv_transit_encryption
@@ -21,6 +23,7 @@ resource "oci_containerengine_node_pool" "tfscaled_workers" {
     nsg_ids                             = each.value.nsg_ids
     defined_tags                        = each.value.defined_tags
     freeform_tags                       = each.value.freeform_tags
+    compute_cluster_id                  = each.value.compute_cluster_id == "" ? lookup(lookup(oci_core_compute_cluster.nodepool_compute_cluster, each.key, {}), "id", "") : each.value.compute_cluster_id
 
     dynamic "placement_configs" {
       for_each = each.value.availability_domains
@@ -29,6 +32,7 @@ resource "oci_containerengine_node_pool" "tfscaled_workers" {
       content {
         availability_domain     = ad.value
         capacity_reservation_id = each.value.capacity_reservation_id
+        host_group_id           = each.value.host_group_id
         subnet_id               = each.value.subnet_id
 
         # Value(s) specified on pool, or null to select automatically
@@ -54,7 +58,14 @@ resource "oci_containerengine_node_pool" "tfscaled_workers" {
     }
 
     dynamic "node_pool_pod_network_option_details" {
-      for_each = var.cni_type == "npn" ? [1] : []
+      for_each = var.cni_type == "npn" && length(each.value.gva_secondary_vnics) > 0 ? [1] : []
+      content { # VCN-Native requires max pods/node, nsg ids, subnet ids
+        cni_type = "OCI_VCN_IP_NATIVE"
+      }
+    }
+
+    dynamic "node_pool_pod_network_option_details" {
+      for_each = var.cni_type == "npn" && length(each.value.gva_secondary_vnics) == 0 ? [1] : []
       content { # VCN-Native requires max pods/node, nsg ids, subnet ids
         cni_type          = "OCI_VCN_IP_NATIVE"
         max_pods_per_node = each.value.max_pods_per_node
@@ -92,6 +103,44 @@ resource "oci_containerengine_node_pool" "tfscaled_workers" {
     )
     is_force_delete_after_grace_duration = tobool(each.value.force_node_delete)
     is_force_action_after_grace_duration = tobool(each.value.force_node_action)
+  }
+
+  dynamic "secondary_vnics" {
+    for_each = each.value.gva_secondary_vnics
+    iterator = vnic
+
+    content {
+      create_vnic_details {
+        subnet_id              = vnic.value.subnet_id
+        application_resources  = vnic.value.application_resources
+        display_name           = lookup(vnic.value, "display_name", vnic.key)
+        assign_public_ip       = vnic.value.assign_public_ip
+        assign_ipv6ip          = vnic.value.assign_ipv6ip
+        defined_tags           = lookup(vnic.value, "defined_tags", each.value.defined_tags)
+        freeform_tags          = lookup(vnic.value, "freeform_tags", each.value.freeform_tags)
+        ip_count               = vnic.value.ip_count
+        nsg_ids                = vnic.value.nsg_ids
+        skip_source_dest_check = vnic.value.skip_source_dest_check
+
+        dynamic "ipv6address_ipv6subnet_cidr_pair_details" {
+          for_each = vnic.value.ipv6_addresses
+          iterator = ipv6_addr
+          content {
+            ipv6address = ipv6_addr.value
+          }
+        }
+
+        dynamic "ipv6address_ipv6subnet_cidr_pair_details" {
+          for_each = vnic.value.ipv6_cidrs
+          iterator = ipv6_cidr
+          content {
+            ipv6subnet_cidr = ipv6_cidr.value
+          }
+        }
+      }
+      nic_index    = vnic.value.nic_index
+      display_name = lookup(vnic.value, "display_name", vnic.key)
+    }
   }
 
   dynamic "node_shape_config" {
@@ -137,10 +186,26 @@ resource "oci_containerengine_node_pool" "tfscaled_workers" {
 
     precondition {
       condition = anytrue([
-        contains(["instance-pool", "cluster-network"], each.value.mode), # supported modes
-        length(lookup(each.value, "secondary_vnics", {})) == 0,          # unrestricted when empty/unset
+        length(lookup(each.value, "gva_secondary_vnics", {})) == 0,
+        var.cni_type == "npn",
       ])
-      error_message = "Unsupported option for mode=${each.value.mode}: secondary_vnics"
+      error_message = "gva_secondary_vnics for managed node pools requires cni_type = npn."
+    }
+
+    precondition {
+      condition = alltrue([
+        for _, vnic in lookup(each.value, "gva_secondary_vnics", {}) :
+        try(trimspace(vnic.subnet_id), "") != ""
+      ])
+      error_message = "gva_secondary_vnics entries must resolve to a non-empty subnet_id. Use cni_type = npn for the default pod subnet, or provide an explicit subnet_id."
+    }
+
+    precondition {
+      condition = alltrue([
+        for _, vnic in lookup(each.value, "gva_secondary_vnics", {}) :
+        contains([1, 2, 4, 8, 16, 32, 64, 128, 256], lookup(vnic, "ip_count", 32))
+      ])
+      error_message = "gva_secondary_vnics ip_count must be a power of two from 1 to 256."
     }
 
     precondition {
@@ -170,6 +235,8 @@ resource "oci_containerengine_node_pool" "autoscaled_workers" {
   node_shape         = each.value.shape
   ssh_public_key     = var.ssh_public_key
 
+  network_launch_type = each.value.network_launch_type
+
   node_config_details {
     size                                = each.value.size
     is_pv_encryption_in_transit_enabled = each.value.pv_transit_encryption
@@ -177,6 +244,7 @@ resource "oci_containerengine_node_pool" "autoscaled_workers" {
     nsg_ids                             = each.value.nsg_ids
     defined_tags                        = each.value.defined_tags
     freeform_tags                       = each.value.freeform_tags
+    compute_cluster_id                  = each.value.compute_cluster_id == "" ? lookup(lookup(oci_core_compute_cluster.nodepool_compute_cluster, each.key, {}), "id", "") : each.value.compute_cluster_id
 
     dynamic "placement_configs" {
       for_each = each.value.availability_domains
@@ -185,6 +253,7 @@ resource "oci_containerengine_node_pool" "autoscaled_workers" {
       content {
         availability_domain     = ad.value
         capacity_reservation_id = each.value.capacity_reservation_id
+        host_group_id           = each.value.host_group_id
         subnet_id               = each.value.subnet_id
 
         # Value(s) specified on pool, or null to select automatically
@@ -210,7 +279,14 @@ resource "oci_containerengine_node_pool" "autoscaled_workers" {
     }
 
     dynamic "node_pool_pod_network_option_details" {
-      for_each = var.cni_type == "npn" ? [1] : []
+      for_each = var.cni_type == "npn" && length(each.value.gva_secondary_vnics) > 0 ? [1] : []
+      content { # VCN-Native requires max pods/node, nsg ids, subnet ids
+        cni_type = "OCI_VCN_IP_NATIVE"
+      }
+    }
+
+    dynamic "node_pool_pod_network_option_details" {
+      for_each = var.cni_type == "npn" && length(each.value.gva_secondary_vnics) == 0 ? [1] : []
       content { # VCN-Native requires max pods/node, nsg ids, subnet ids
         cni_type          = "OCI_VCN_IP_NATIVE"
         max_pods_per_node = each.value.max_pods_per_node
@@ -248,6 +324,44 @@ resource "oci_containerengine_node_pool" "autoscaled_workers" {
     )
     is_force_delete_after_grace_duration = tobool(each.value.force_node_delete)
     is_force_action_after_grace_duration = tobool(each.value.force_node_action)
+  }
+
+  dynamic "secondary_vnics" {
+    for_each = each.value.gva_secondary_vnics
+    iterator = vnic
+
+    content {
+      create_vnic_details {
+        subnet_id              = vnic.value.subnet_id
+        application_resources  = vnic.value.application_resources
+        display_name           = lookup(vnic.value, "display_name", vnic.key)
+        assign_public_ip       = vnic.value.assign_public_ip
+        assign_ipv6ip          = vnic.value.assign_ipv6ip
+        defined_tags           = lookup(vnic.value, "defined_tags", each.value.defined_tags)
+        freeform_tags          = lookup(vnic.value, "freeform_tags", each.value.freeform_tags)
+        ip_count               = vnic.value.ip_count
+        nsg_ids                = vnic.value.nsg_ids
+        skip_source_dest_check = vnic.value.skip_source_dest_check
+
+        dynamic "ipv6address_ipv6subnet_cidr_pair_details" {
+          for_each = vnic.value.ipv6_addresses
+          iterator = ipv6_addr
+          content {
+            ipv6address = ipv6_addr.value
+          }
+        }
+
+        dynamic "ipv6address_ipv6subnet_cidr_pair_details" {
+          for_each = vnic.value.ipv6_cidrs
+          iterator = ipv6_cidr
+          content {
+            ipv6subnet_cidr = ipv6_cidr.value
+          }
+        }
+      }
+      nic_index    = vnic.value.nic_index
+      display_name = lookup(vnic.value, "display_name", vnic.key)
+    }
   }
 
   dynamic "node_shape_config" {
@@ -293,10 +407,26 @@ resource "oci_containerengine_node_pool" "autoscaled_workers" {
 
     precondition {
       condition = anytrue([
-        contains(["instance-pool", "cluster-network"], each.value.mode), # supported modes
-        length(lookup(each.value, "secondary_vnics", {})) == 0,          # unrestricted when empty/unset
+        length(lookup(each.value, "gva_secondary_vnics", {})) == 0,
+        var.cni_type == "npn",
       ])
-      error_message = "Unsupported option for mode=${each.value.mode}: secondary_vnics"
+      error_message = "gva_secondary_vnics for managed node pools requires cni_type = npn."
+    }
+
+    precondition {
+      condition = alltrue([
+        for _, vnic in lookup(each.value, "gva_secondary_vnics", {}) :
+        try(trimspace(vnic.subnet_id), "") != ""
+      ])
+      error_message = "gva_secondary_vnics entries must resolve to a non-empty subnet_id. Use cni_type = npn for the default pod subnet, or provide an explicit subnet_id."
+    }
+
+    precondition {
+      condition = alltrue([
+        for _, vnic in lookup(each.value, "gva_secondary_vnics", {}) :
+        contains([1, 2, 4, 8, 16, 32, 64, 128, 256], lookup(vnic, "ip_count", 32))
+      ])
+      error_message = "gva_secondary_vnics ip_count must be a power of two from 1 to 256."
     }
 
     precondition {
@@ -311,5 +441,28 @@ resource "oci_containerengine_node_pool" "autoscaled_workers" {
       key   = initial_node_labels.key
       value = initial_node_labels.value
     }
+  }
+}
+
+
+resource "oci_core_compute_cluster" "nodepool_compute_cluster" {
+  for_each = { for key, value in local.enabled_node_pools : key => value
+    if alltrue([
+      lookup(value, "use_compute_cluster", false),
+      lookup(value, "compute_cluster_id", "") == ""
+    ])
+  }
+
+  availability_domain = element(each.value.availability_domains, 1)
+  compartment_id      = var.compartment_id
+
+  display_name  = format("%s-%s", each.key, var.state_id)
+  freeform_tags = each.value.freeform_tags
+  defined_tags  = each.value.defined_tags
+
+  lifecycle { # prevent resources changes for changed fields
+    ignore_changes = [
+      defined_tags, freeform_tags
+    ]
   }
 }

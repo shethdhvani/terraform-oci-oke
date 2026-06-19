@@ -8,8 +8,9 @@ variable "network_compartment_id" { type = string }
 variable "state_id" { type = string }
 variable "tenancy_id" { type = string }
 variable "worker_compartments" { type = list(string) }
-variable "enable_ipv6" { type = bool }
+variable "enable_dual_stack_defaults" { type = bool }
 variable "cni_type" { type = string }
+
 # Tags
 variable "create_iam_defined_tags" { type = bool }
 variable "create_iam_tag_namespace" { type = bool }

@@ -89,8 +89,9 @@ Relevant diagrams:
 | `vcn_id` | OCID of an existing VCN. Required when `create_vcn = false`. | OCID string | `null` |
 | `vcn_cidrs` | IPv4 CIDR blocks for the VCN. | list(string) | `["10.0.0.0/16"]` |
 | `vcn_dns_label` | DNS label for the VCN. | string | `null` |
-| `vcn_enable_ipv6_gua` | Enable IPv6 Global Unicast Address. | `true` / `false` | `true` |
-| `vcn_ipv6_ula_cidrs` | IPv6 ULA CIDR blocks for the VCN. | list(string) | `[]` |
+| `vcn_enable_ipv6_gua` | Enable Oracle-allocated IPv6 Global Unicast Address blocks when IPv6 networking is enabled. | `true` / `false` | `true` |
+| `vcn_ipv6_ula_cidrs` | IPv6 ULA CIDR blocks for the VCN. Providing values enables IPv6 networking for the VCN. | list(string) | `[]` |
+| `vcn_byoipv6cidr_details` | BYOIPv6 CIDR blocks for the VCN. Providing values enables IPv6 networking for the VCN. Each item includes `byoipv6range_id` and `ipv6cidr_block`. | list(object) | `[]` |
 | `assign_dns` | Whether to assign DNS records to created instances and subnet hostname labels. | `true` / `false` | `true` |
 | `lockdown_default_seclist` | Remove all default rules from the VCN default security list. | `true` / `false` | `true` |
 
@@ -111,7 +112,7 @@ Relevant diagrams:
 | --- | --- | --- | --- |
 | `ig_route_table_id` | OCID of an existing internet gateway route table. | OCID string | `null` |
 | `nat_route_table_id` | OCID of an existing NAT gateway route table. | OCID string | `null` |
-| `igw_ngw_mixed_route_id` | OCID of a mixed route table (NAT GW for IPv4, IGW for IPv6). | OCID string | `null` |
+| `igw_ngw_mixed_route_id` | OCID of a mixed route table (NAT GW for IPv4, IGW for IPv6). When the module creates the VCN with public IPv6, internet gateway, and NAT gateway enabled, this route table is created by the VCN module. | OCID string | `null` |
 | `internet_gateway_route_rules` | Additional route rules for the internet gateway route table. | list(map(string)) | `null` |
 | `nat_gateway_route_rules` | Additional route rules for the NAT gateway route table. | list(map(string)) | `null` |
 
@@ -133,7 +134,7 @@ See [Network layout](./diagrams.md#network-layout) for the default subnet split 
 
 | Parameter | Description | Values | Default |
 | --- | --- | --- | --- |
-| `subnets` | Configuration for standard subnets (bastion, operator, cp, int_lb, pub_lb, workers, pods). Each entry supports `create`, `id`, `cidr`, `netnum`, `newbits`, `display_name`, `dns_label`, and `ipv6_cidr`. | map(object) | Module-defined defaults for all standard subnets |
+| `subnets` | Configuration for standard and custom subnets. Standard keys are `bastion`, `operator`, `cp`, `int_lb`, `pub_lb`, `workers`, `pods`, and optional `fss`; additional keys create custom subnets. Each entry supports `create`, `id`, `cidr`, `netnum`, `newbits`, `display_name`, `dns_label`, `ipv6_cidr`, `ipv4_cidrs`, `ipv6_cidrs`, and `is_public`. | map(object) | Module-defined defaults for standard subnets |
 
 Example with automatic subnet creation:
 
@@ -173,13 +174,32 @@ subnets = {
 }
 ```
 
+Example with multiple CIDR blocks and a custom subnet:
+
+```hcl
+subnets = {
+  workers = {
+    ipv4_cidrs = ["10.0.16.0/20", "10.0.32.0/20"]
+    ipv6_cidrs = ["fd00:100::/64", "fd00:101::/64"]
+  }
+  services = {
+    cidr         = "10.0.200.0/24"
+    display_name = "oke-services"
+    dns_label    = "services"
+    is_public    = false
+  }
+}
+```
+
+`ipv4_cidrs` and `ipv6_cidrs` assign multiple CIDR blocks to a subnet. Elements in `ipv4_cidrs`, `ipv6_cidr`, and `ipv6_cidrs` can be explicit CIDRs or offsets in `"newbits, netnum"` form. IPv6 offset values require at least one VCN IPv6 CIDR block from Oracle GUA, private ULA, or BYOIPv6 configuration.
+
 ### Network Security Groups
 
 See [Network layout](./diagrams.md#network-layout) for how the NSG-backed subnet boundaries fit together.
 
 | Parameter | Description | Values | Default |
 | --- | --- | --- | --- |
-| `nsgs` | Configuration for NSGs (bastion, operator, cp, int_lb, pub_lb, workers, pods, optional `fss`). Each entry supports `create` and `id`. | map(object) | Module-defined defaults for standard NSGs |
+| `nsgs` | Configuration for standard and custom NSGs. Standard keys are `bastion`, `operator`, `cp`, `int_lb`, `pub_lb`, `workers`, `pods`, and optional `fss`; additional keys create custom NSGs. Each entry supports `create`, `id`, and inline `rules`. | map(object) | Module-defined defaults for standard NSGs |
 | `allow_node_port_access` | Allow NodePort access to load balancers. | `true` / `false` | `false` |
 | `allow_worker_internet_access` | Allow worker nodes outbound internet access. | `true` / `false` | `true` |
 | `allow_pod_internet_access` | Allow pod outbound internet access. | `true` / `false` | `true` |
@@ -204,6 +224,30 @@ allow_rules_workers = {
 }
 ```
 
+Rules can also be attached directly to a standard or custom NSG entry:
+
+```hcl
+nsgs = {
+  workers = {
+    rules = {
+      "Allow TCP 8080 from VCN" = {
+        protocol = 6, port = 8080, source = "10.0.0.0/16", source_type = "CIDR_BLOCK",
+      }
+    }
+  }
+  app = {
+    create = "always"
+    rules = {
+      "Allow HTTPS from workers" = {
+        protocol = 6, port = 443, source = "workers", source_type = "NETWORK_SECURITY_GROUP",
+      }
+    }
+  }
+}
+```
+
+Custom NSG keys can be referenced by other NSG rules and worker networking settings by name. Existing NSGs can be supplied with `id`; otherwise custom keys are created when `create` is `auto` or `always`.
+
 ## Cluster
 
 Relevant diagrams:
@@ -221,8 +265,9 @@ Relevant diagrams:
 | `control_plane_nsg_ids` | Additional NSG IDs for the cluster endpoint. | set(string) | `[]` |
 | `backend_nsg_ids` | Additional NSG IDs for load balancer backends. Workers and pods NSGs are always included. | set(string) | `[]` |
 | `cni_type` | Container Network Interface type. | `"flannel"` / `"npn"` | `"flannel"` |
-| `enable_ipv6` | Create a dual-stack (IPv4 and IPv6) cluster. | `true` / `false` | `false` |
-| `oke_ip_families` | Override the `ip_families` cluster attribute. | list(string) | `[]` |
+| `enable_ipv6` | Deprecated compatibility alias for `enable_dual_stack_defaults`. | `true` / `false` | `false` |
+| `enable_dual_stack_defaults` | Apply default dual-stack settings for the OKE cluster and network. When enabled, OKE defaults to `["IPv4", "IPv6"]`, standard subnets receive default IPv6 CIDR offsets, and control plane, worker, and pod subnets default to public routing where required for IPv6. | `true` / `false` | `false` |
+| `oke_ip_families` | Override the `ip_families` cluster attribute. Defaults to `["IPv4", "IPv6"]` when dual-stack defaults are enabled, otherwise `["IPv4"]`. | list(string) | `[]` |
 | `pods_cidr` | CIDR range for Kubernetes pods. Must not overlap with VCN, worker, or LB subnets. | CIDR string | `"10.244.0.0/16"` |
 | `services_cidr` | CIDR range for Kubernetes services. Must not overlap with the VCN CIDR. | CIDR string | `"10.96.0.0/16"` |
 | `kubernetes_version` | Kubernetes version for the cluster. | string (e.g. `"v1.34.2"`) | `"v1.34.2"` |
@@ -372,6 +417,8 @@ Each entry in the `worker_pools` map supports the following attributes:
 | `assign_public_ip` | Assign a public IP to nodes. | `true` / `false` |
 | `cloud_init` | Pool-specific cloud-init MIME parts. | list(map(string)) |
 | `secondary_vnics` | Secondary VNIC configurations. | map(any) |
+| `network_launch_type` | Network launch type for managed node pools when required by the selected networking feature. | string |
+| `gva_secondary_vnics` | GVA secondary VNIC configuration for supported worker pools. Requires `cni_type = "npn"` and is not supported for `mode = "virtual-node-pool"`. Defaults to the pod subnet through `subnet_key = "pods"`. | map(any) |
 | `autoscale` | Enable cluster autoscaler for this pool. | `true` / `false` |
 | `min_size` | Minimum pool size for autoscaling. | number |
 | `max_size` | Maximum pool size for autoscaling. | number |
@@ -380,6 +427,9 @@ Each entry in the `worker_pools` map supports the following attributes:
 | `drain` | Mark pool for draining (disables scheduling, drains through operator). | `true` / `false` |
 | `placement_ads` | List of AD numbers for placement. | list(number) |
 | `compute_cluster` | Name of a shared compute cluster (compute-cluster mode). | string |
+| `compute_cluster_id` | Existing compute cluster OCID to attach a managed node pool to. Takes precedence over `use_compute_cluster`. | OCID string |
+| `use_compute_cluster` | Create a dedicated compute cluster for this managed node pool. Ignored when `compute_cluster_id` is set. | `true` / `false` |
+| `host_group_id` | Host group OCID constraining managed node pool placement to a dedicated host group. | OCID string |
 | `instance_ids` | Instance IDs in compute cluster. | list(string) |
 | `platform_config` | Platform configuration (shielded instances). | object |
 | `agent_config` | Management agent configuration. | object |
@@ -423,6 +473,32 @@ worker_pools = {
 }
 ```
 
+Worker pool with GVA secondary VNICs:
+
+```hcl
+cni_type = "npn"
+
+worker_pools = {
+  gva-node-pool = {
+    mode                = "node-pool"
+    size                = 2
+    shape               = "VM.Standard..."
+    network_launch_type = "..."
+
+    gva_secondary_vnics = {
+      pods = {
+        # Defaults to subnet_key = "pods"; set subnet_id to use an explicit subnet OCID.
+        ip_count               = 16
+        skip_source_dest_check = true
+        nsg_ids                = ["pods"]
+      }
+    }
+  }
+}
+```
+
+`gva_secondary_vnics` is valid for managed node pools and self-managed worker pools with `cni_type = "npn"`, except virtual node pools. Supported self-managed modes include `instance`, `instance-pool`, `cluster-network`, `gpu-memory-cluster`, and `compute-cluster`. When `subnet_id` is omitted, the module resolves `subnet_key`, which defaults to `pods`, through the module subnet map. `nsg_ids` accepts NSG OCIDs or names from the module NSG map.
+
 Cluster network (HPC/GPU) example:
 
 ```hcl
@@ -442,6 +518,24 @@ worker_pools = {
   }
 }
 ```
+
+Managed node pool in a compute cluster (HPC/GPU):
+
+```hcl
+worker_pools = {
+  oke-bm-gpu-rdma-np = {
+    mode                = "node-pool"
+    size                = 2
+    shape               = "BM.GPU.B4.8"
+    placement_ads       = [1]
+    use_compute_cluster = true
+  }
+}
+```
+
+Set `use_compute_cluster = true` for the module to create a dedicated compute cluster and place the managed node pool in it, or set `compute_cluster_id` to attach the pool to an existing compute cluster. `compute_cluster_id` takes precedence when both are set. Use `host_group_id` to constrain placement to a dedicated host group.
+
+A managed node pool with `use_compute_cluster = true` or an explicit `compute_cluster_id` is a deployment model that supports RDMA workloads. It is an alternative to `mode = "cluster-network"` for GPU/HPC workloads, using OKE-managed node pools instead of self-managed instances.
 
 ## Bastion
 
@@ -752,6 +846,12 @@ service_accounts = {
 - `oidc_token_auth_enabled = true` requires `cluster_type = "enhanced"`.
 - `worker_pool_mode = "node-pool"` is the only mode that supports OKE-managed node pools.
 - `worker_pool_mode = "cluster-network"` or `"instance-pool"` or `"instance"` are self-managed modes.
+- `gva_secondary_vnics` requires `cni_type = "npn"` and is not supported for virtual node pools.
+- Each `gva_secondary_vnics` entry must resolve to a non-empty subnet OCID, either from explicit `subnet_id` or from `subnet_key`.
+- Subnet `id` is exclusive with CIDR inputs (`cidr`, `netnum`/`newbits`, `ipv4_cidrs`, `ipv6_cidr`, or `ipv6_cidrs`).
+- Each subnet can use only one IPv4 CIDR source: `cidr`, `netnum`/`newbits`, or `ipv4_cidrs`.
+- Each subnet can use only one IPv6 CIDR source: `ipv6_cidr` or `ipv6_cidrs`.
+- IPv6 subnet CIDR offset syntax requires at least one configured VCN IPv6 CIDR block.
 - Pods CIDR must not overlap with VCN, worker, or load balancer subnets.
 - Services CIDR must not overlap with the VCN CIDR.
 
@@ -793,6 +893,7 @@ service_accounts = {
 | `pub_lb_subnet_cidr` | Public load balancer subnet CIDR. |
 | `fss_subnet_id` | FSS subnet OCID. |
 | `fss_subnet_cidr` | FSS subnet CIDR. |
+| `subnet_ids` | Map of created or supplied subnet OCIDs keyed by subnet name. |
 | `bastion_nsg_id` | Bastion NSG OCID. |
 | `operator_nsg_id` | Operator NSG OCID. |
 | `control_plane_nsg_id` | Control plane NSG OCID. |
@@ -801,6 +902,7 @@ service_accounts = {
 | `worker_nsg_id` | Worker NSG OCID. |
 | `pod_nsg_id` | Pod NSG OCID. |
 | `fss_nsg_id` | FSS NSG OCID. |
+| `custom_nsg_ids` | Map of custom NSG OCIDs, keyed by NSG name. |
 | `network_security_rules` | Map of all NSG security rules (requires `output_detail = true`). |
 | `availability_domains` | Map of availability domains. |
 | `dynamic_group_ids` | IAM dynamic group OCIDs. |

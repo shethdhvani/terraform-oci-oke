@@ -100,14 +100,22 @@ variable "cni_type" {
   }
 }
 
-variable "enable_ipv6" {
-  default     = false
-  description = "Whether to create a dual-stack (IPv4/IPv6) cluster."
-  type        = bool
+variable "oke_ip_families" {
+  default     = ["IPv4"]
+  description = "The IP families configured for the cluster."
+  type        = list(string)
 }
 
 variable "pod_subnet_id" { type = string }
 variable "worker_subnet_id" { type = string }
+variable "subnet_ids" {
+  type    = map(string)
+  default = {}
+}
+variable "nsg_ids" {
+  type    = map(string)
+  default = {}
+}
 
 # Worker pools
 
@@ -366,4 +374,3 @@ variable "compute_clusters" {
   description = "Whether to create compute clusters shared by nodes across multiple worker pools enabled for 'compute-cluster'."
   type        = map(any)
 }
-

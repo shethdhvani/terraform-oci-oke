@@ -112,6 +112,7 @@ resource "oci_core_instance" "compute_cluster_workers" {
 
   create_vnic_details {
     assign_private_dns_record = var.assign_dns
+    assign_ipv6ip             = each.value.assign_ipv6ip
     assign_public_ip          = each.value.assign_public_ip
     nsg_ids                   = each.value.nsg_ids
     subnet_id                 = each.value.subnet_id
@@ -131,18 +132,46 @@ resource "oci_core_instance" "compute_cluster_workers" {
       oke-kubeproxy-proxy-mode = var.kubeproxy_mode
       oke-tenancy-id           = var.tenancy_id
       oke-initial-node-labels  = join(",", [for k, v in each.value.node_labels : format("%v=%v", k, v)])
-      secondary_vnics          = jsonencode(lookup(each.value, "secondary_vnics", {}))
       ssh_authorized_keys      = var.ssh_public_key
       user_data                = lookup(lookup(data.cloudinit_config.workers, element(split("###", each.key), 0), {}), "rendered", "")
     },
 
     # Add labels required for NPN CNI.
-    var.cni_type == "npn" ? {
-      oke-native-pod-networking = true
-      oke-max-pods              = each.value.max_pods_per_node
-      pod-subnets               = each.value.pod_subnet_id
-      pod-nsgids                = join(",", each.value.pod_nsg_ids)
-    } : {},
+    var.cni_type == "npn" ? merge(
+      length(each.value.gva_secondary_vnics) == 0 ?
+      {
+        oke-native-pod-networking = true
+        oke-max-pods              = each.value.max_pods_per_node
+        pod-subnets               = each.value.pod_subnet_id
+        pod-nsgids                = join(",", each.value.pod_nsg_ids)
+      } :
+      {
+        oke-native-pod-networking = true
+        oke-max-pods              = sum([for key, va in each.value.gva_secondary_vnics : va.ip_count])
+        secondary-vnics = jsonencode([for key, va in each.value.gva_secondary_vnics : {
+          createVnicDetails = merge(
+            {
+              displayName         = lookup(va, "display_name", key)
+              subnetId            = va.subnet_id
+              ipCount             = va.ip_count
+              nsgIds              = va.nsg_ids
+              skipSourceDestCheck = va.skip_source_dest_check
+            },
+            va.application_resources != null ? { applicationResources = va.application_resources } : {},
+            va.assign_public_ip == true ? { assignPublicIp = va.assign_public_ip } : {},
+            va.assign_ipv6ip == true ? { assignIpv6Ip = va.assign_ipv6ip } : {},
+          )
+          nicIndex    = va.nic_index
+          displayName = lookup(va, "display_name", key)
+          }
+        ])
+      },
+      local.oke_uses_ipv6 ?
+      {
+        ip-families = join(",", var.oke_ip_families)
+      } : {}
+    ) :
+    {},
 
     # Only provide cluster DNS service address if set explicitly; determined automatically in practice.
     coalesce(var.cluster_dns, "none") == "none" ? {} : { kubedns_svc_ip = var.cluster_dns },
@@ -168,6 +197,30 @@ resource "oci_core_instance" "compute_cluster_workers" {
         image_type: ${coalesce(each.value.image_type, "none")}
         image_id: ${coalesce(each.value.image_id, "none")}
       EOT
+    }
+
+    precondition {
+      condition = anytrue([
+        length(lookup(each.value, "gva_secondary_vnics", {})) == 0,
+        var.cni_type == "npn",
+      ])
+      error_message = "gva_secondary_vnics for compute cluster workers requires cni_type = npn."
+    }
+
+    precondition {
+      condition = alltrue([
+        for _, vnic in lookup(each.value, "gva_secondary_vnics", {}) :
+        try(trimspace(vnic.subnet_id), "") != ""
+      ])
+      error_message = "gva_secondary_vnics entries must resolve to a non-empty subnet_id. Use cni_type = npn for the default pod subnet, or provide an explicit subnet_id."
+    }
+
+    precondition {
+      condition = alltrue([
+        for _, vnic in lookup(each.value, "gva_secondary_vnics", {}) :
+        contains([1, 2, 4, 8, 16, 32, 64, 128, 256], lookup(vnic, "ip_count", 32))
+      ])
+      error_message = "gva_secondary_vnics ip_count must be a power of two from 1 to 256."
     }
 
     ignore_changes = [
